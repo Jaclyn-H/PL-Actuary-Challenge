@@ -1,0 +1,3 @@
+estimand,crude,iptw
+abs risk diff (wear - no_wear),-0.025245070144576102,-0.026423818401010317
+relative risk (wear / no_wear),0.6973106031868446,0.680772098061016

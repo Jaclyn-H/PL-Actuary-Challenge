@@ -1,0 +1,35 @@
+# --- Competition data (do NOT share) ---
+data/
+*.csv
+*.parquet
+*.pdf
+# Re-include a few small ones we DO want in the repo
+!output/tables/*.csv
+!output/submission/*.csv
+!output/submission/feature_coefficients.csv
+
+# --- Python ---
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.ipynb_checkpoints/
+
+# --- R ---
+.Rhistory
+.RData
+.Rproj.user/
+*_cache/
+*_files/
+r/phase3_selection_effects.html
+README.html
+
+# --- macOS / editor noise ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# --- Big model intermediates we can re-create ---
+output/models/*.joblib

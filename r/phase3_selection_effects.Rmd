@@ -1,0 +1,299 @@
+---
+title: "Phase 3 — Selection-Effect Investigation"
+subtitle: "Pacific Life AI Actuary Challenge 2026"
+author: "Team 7"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+  pdf_document:
+    toc: true
+knitr:
+  opts_chunk:
+    echo: true
+    message: false
+    warning: false
+    fig.align: center
+    fig.width: 8
+    fig.height: 5
+    dpi: 150
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+
+```
+
+# Purpose
+
+The Phase 2 modeling result was negative: adding wearable + diagnosis features to the baseline underwriter (M0) **degrades** out-of-fold log-loss and breaks calibration. To make the recommendation defensible we need to explain *why* the apparent crude wearable benefit (8.34% -> 5.82% mortality) doesn't survive inclusion in a model that already has age, BMI, smoker, and diagnosed conditions.
+
+We test five things in this notebook:
+
+1. **Propensity model** — *who* chooses to wear a device?
+2. **Covariate balance** before and after inverse-propensity-treatment-weighting.
+3. **IPTW marginal effect** of wearable on mortality.
+4. **Engagement dose-response** — raw and age-stratified.
+5. **Negative-control falsification** — variables that *cannot* causally
+   affect mortality (operating system, dominant hand) but show how much
+   confounding remains.
+
+# Setup
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(dplyr); library(readr); library(ggplot2); library(tidyr)
+  library(WeightIt); library(cobalt); library(scales); library(patchwork)
+  library(broom)
+})
+
+set.seed(42)
+dir.create("output/figures", showWarnings = FALSE, recursive = TRUE)
+dir.create("output/tables",  showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r load-data}
+df <- read_csv("data/processed/features_train.csv", show_col_types = FALSE)
+glimpse(select(df, ID, wearable, engagement_level, age, bmi, outcome))
+```
+
+# 1. Propensity Model — who chooses a wearable?
+
+If wearable adopters are systematically different from non-adopters, any
+mortality difference between the groups is partly *selection* and partly
+(possibly zero) *causal*. The propensity model estimates the probability of
+adopting based only on baseline traits.
+
+```{r propensity-fit}
+prop_vars = c("age", "bmi", "smoker", "weekly_exercise",
+               "alcohol_consumption_frequency",
+               "family_medical_diabetes", "family_medical_cancer",
+               "family_medical_dementia", "family_medical_heart_disease",
+               "diagnosed_diabetes", "diagnosed_lung_cancer",
+               "diagnosed_other_cancer", "diagnosed_sleep_apnea",
+               "diagnosed_afib", "diagnosed_hypertension",
+               "diagnosed_dementia")
+
+prop_formula = as.formula(
+  paste("wearable ~ sex + age_bin +", paste(prop_vars, collapse = " + "))
+)
+
+prop_fit = glm(prop_formula, family = binomial(), data = df)
+df$pscore = predict(prop_fit, type = "response")
+```
+
+```{r propensity-coefs}
+prop_tbl = tidy(prop_fit, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  arrange(p.value)
+
+write_csv(prop_tbl, "output/tables/phase3_propensity_coefs.csv")
+
+knitr::kable(head(prop_tbl, 10), digits = 3,
+             caption = "Top 10 wearable-adoption predictors (odds ratios)")
+```
+
+**Interpretation.** `weekly_exercise` has an odds ratio of ~1.69 — each
+additional day per week of exercise nearly doubles the odds of adopting a
+wearable. `alcohol_consumption_frequency` and most diagnosed-condition flags
+push the other way. **Adopters are systematically healthier on observable
+lifestyle dimensions.**
+
+```{r overlap-plot, fig.cap="Propensity-score distribution by wearable status"}
+p_overlap = ggplot(df, aes(x = pscore, fill = factor(wearable))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("0" = "#d7191c", "1" = "#2c7bb6"),
+                    labels = c("No wearable", "Wearable"), name = NULL) +
+  labs(title = "Propensity-score overlap",
+       subtitle = "Wearable adopters are systematically different",
+       x = "P(wearable = 1 | baseline traits)", y = "Density")
+  theme_minimal(base_size = 12)
+
+ggsave("output/figures/phase3_pscore_overlap.png",
+       p_overlap, width = 7, height = 4.5, dpi = 200)
+p_overlap
+
+```
+
+# 2. IPTW — covariate balance before vs. after weighting
+
+`WeightIt::weightit` builds stabilized inverse-propensity weights so the
+treated and control groups look comparable on observable covariates. We
+visualize this with a `cobalt` love plot.
+
+```{r iptw-fit}
+W = weightit(prop_formula, data = df, method = "glm",
+              estimand = "ATE", stabilize = TRUE)
+df$ipw = W$weights
+summary(W$weights)
+```
+
+```{r love-plot, fig.cap="Standardized mean differences before vs. after IPTW"}
+love.plot(W, binary = "std", thresholds = c(m = 0.1),
+          title = "Covariate balance: unweighted vs. IPTW",
+          colors = c("#e84118", "#1e3799"),
+          shapes = c(16, 17))
+
+png("output/figures/phase3_balance_loveplot.png",
+    width = 1400, height = 900, res = 180)
+print(love.plot(W, binary = "std", thresholds = c(m = 0.1),
+                title = "Covariate balance: unweighted vs. IPTW",
+                colors = c("#e84118", "#1e3799"),
+                shapes = c(16, 17)))
+invisible(dev.off())
+```
+
+# 3. Marginal effect — crude vs. IPTW
+
+```{r marginal-rates}
+crude_rates <- df |>
+  group_by(wearable) |>
+  summarise(n = n(), deaths = sum(outcome), rate = mean(outcome))
+
+iptw_rates <- df |>
+  group_by(wearable) |>
+  summarise(n = n(),
+            rate_ipw = sum(outcome * ipw) / sum(ipw))
+
+est_tbl <- crude_rates |>
+  left_join(iptw_rates |> select(wearable, rate_ipw), by = "wearable")
+
+write_csv(est_tbl, "output/tables/phase3_marginal_estimates.csv")
+knitr::kable(est_tbl, digits = 4,
+             caption = "Mortality (crude vs. IPTW-adjusted)")
+```
+
+```{r ate-summary}
+crude_diff = diff(crude_rates$rate)
+iptw_diff = diff(iptw_rates$rate_ipw)
+crude_rr = crude_rates$rate[2] / crude_rates$rate[1]
+iptw_rr = iptw_rates$rate_ipw[2] / iptw_rates$rate_ipw[1]
+
+ate_tbl = tibble(
+  estimand = c("abs risk diff (wear - no_wear)",
+               "relative risk (wear / no_wear)"),
+  crude = c(crude_diff, crude_rr),
+  iptw  = c(iptw_diff, iptw_rr)
+)
+
+write_csv(ate_tbl, "output/tables/phase3_ate_summary.csv")
+knitr::kable(ate_tbl, digits = 4,
+             caption = "Wearable effect estimates: crude vs. IPTW")
+```
+
+**Important nuance.** The IPTW estimate is essentially identical to the
+crude estimate. That tells us *observable* covariates do **not** explain the
+wearable–mortality association. Two interpretations remain:
+
+- **(a) Real protective effect** — possible but uncomfortably large for a
+  wellness intervention.
+- **(b) Unobserved confounding** — adopters likely differ on wealth, SES,
+  healthcare access, and behavioral traits we cannot measure.
+
+The negative-control test in Section 5 lets us distinguish these.
+
+# 4. Engagement dose-response
+
+```{r dose-response, fig.width=11, fig.height=4.5, fig.cap="Mortality by engagement (raw and age-stratified)"}
+dose_raw = df |>
+  group_by(engagement_level) |>
+  summarise(n = n(), rate = mean(outcome),
+            se = sqrt(rate * (1 - rate) / n))
+
+p_dose_raw = ggplot(dose_raw,
+                     aes(x = factor(engagement_level), y = rate)) +
+  geom_col(fill = "#1e3799", alpha = 0.85) +
+  geom_errorbar(aes(ymin = pmax(0, rate - 1.96 * se),
+                    ymax = rate + 1.96 * se),
+                width = 0.15, color = "gray30") +
+  geom_text(aes(label = scales::percent(rate, accuracy = 0.1)),
+            vjust = -1.6, size = 3.2) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1),
+                     expand = expansion(mult = c(0, 0.18))) +
+  labs(title = "Mortality by engagement tier (raw)",
+       subtitle = "Tier 5 reverses the trend — selection signal",
+       x = "Engagement level (0 = no wearable)", y = "10-yr mortality rate") +
+  theme_minimal(base_size = 12)
+
+dose_age <- df |>
+  group_by(age_bin, engagement_level) |>
+  summarise(n = n(), rate = mean(outcome), .groups = "drop") |>
+  filter(n >= 20)
+
+p_dose_age = ggplot(dose_age,
+                     aes(x = factor(engagement_level), y = rate,
+                         group = age_bin, color = age_bin)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_color_brewer(palette = "Set1", name = "Age bin") +
+  labs(title = "Engagement-mortality, stratified by age",
+       subtitle = "Age explains most of apparent benefit",
+       x = "Engagement level", y = "Mortality rate") +
+  theme_minimal(base_size = 12)
+
+combined = p_dose_raw + p_dose_age + plot_layout(widths = c(1, 1.2))
+ggsave("output/figures/phase3_dose_response.png",
+       combined, width = 11.5, height = 4.5, dpi = 200)
+combined
+```
+
+# 5. Negative-control falsification
+
+If the wearable–mortality link is causal, then variables with no plausible causal path to mortality (operating system, dominant hand) should show **flat** mortality across their levels. If they don't, residual confounding remains.
+
+```{r neg-controls}
+neg_vars = c("dominant_hand", "os")
+neg_results <- list()
+
+for (v in neg_vars) {
+  if (v %in% names(df)) {
+    sub = df |>
+      filter(!is.na(.data[[v]])) |>
+      group_by(across(all_of(v))) |>
+      summarise(n = n(), rate = mean(outcome), .groups = "drop") |>
+      filter(n >= 50)
+    sub$variable = v
+    names(sub)[1] = "level"
+    neg_results[[v]] = sub
+  }
+}
+
+neg_df = bind_rows(neg_results)
+write_csv(neg_df, "output/tables/phase3_negative_controls.csv")
+
+knitr::kable(neg_df, digits = 4,
+             caption = "Mortality by 'placebo' variables (should be flat)")
+```
+
+**Smoking gun.** Mortality varies by **operating system version** — iOS 18 users die at 4.88%, Android 13 users at 7.87%. OS cannot causally affect mortality, so this 3-percentage-point gap is **pure confounding** (plausibly socioeconomic: newest/most-expensive devices correlate with wealth, healthcare access, and survival). Any wearable feature is going to inherit this confounding. That is why the M1 model in Phase 2 fails to generalize.
+
+# 6. Persist propensity scores & weights for downstream use
+
+```{r persist}
+df |>
+  select(ID, wearable, engagement_level, pscore, ipw, outcome) |>
+  write_csv("output/tables/phase3_pscore_weights.csv")
+
+cat("Phase 3 complete. Outputs:\n",
+    "  - output/figures/phase3_pscore_overlap.png\n",
+    "  - output/figures/phase3_balance_loveplot.png\n",
+    "  - output/figures/phase3_dose_response.png\n",
+    "  - output/tables/phase3_propensity_coefs.csv\n",
+    "  - output/tables/phase3_marginal_estimates.csv\n",
+    "  - output/tables/phase3_ate_summary.csv\n",
+    "  - output/tables/phase3_negative_controls.csv\n",
+    "  - output/tables/phase3_pscore_weights.csv\n", sep = "")
+```
+
+# Take-aways for the deck
+
+| Finding | Where it lives in the deck |
+|---|---|
+| Adopters self-select on `weekly_exercise` (OR ≈ 1.69) | Slide 6 (selection effects) |
+| IPTW barely changes the wearable effect | Slide 6 (residual unobserved confounding) |
+| Engagement tier 5 reverses the dose-response | Slide 3 (cohort design) |
+| OS version predicts mortality (placebo violation) | Slide 6 (smoking gun) |
+| Wearable signal cannot be cleanly identified | Slide 8 (recommendation) |
